@@ -7,7 +7,7 @@ from sqlalchemy import and_, or_, select
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
 from src.models.tables import audit, cases, evidence, runs
-from src.services import domain
+from src.services import domain, run_stock
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
@@ -84,10 +84,27 @@ def finish(run_id, token, result=None, error=None):
                         runs.c.attempt_token == token, runs.c.status == Status.RUNNING)
                         .values(status=status, finished_at=utc_time(), error=error)).rowcount
         if not count:
+            # A superseded attempt may not issue evidence or clear checkpoints.
             return
         if result is not None:
             conn.execute(evidence.insert().values(run_id=run_id, report=result, digest=digest))
+        run_stock.cleanup(conn, run_id)
         log(conn, 'worker', status.value, run_id)
+
+
+def requeue(run_id, token):
+    """Send an interrupted run back to the queue, keeping its posted checkpoints."""
+    with engine.begin() as conn:
+        count = conn.execute(runs.update().where(runs.c.id == run_id,
+                        runs.c.attempt_token == token, runs.c.status == Status.RUNNING)
+                        .values(status=Status.QUEUED)).rowcount
+        if count:
+            log(conn, 'worker', 'requeue', run_id)
+    try:
+        cache.lpush('worker:wake', 'queued')
+        cache.ltrim('worker:wake', 0, 99)
+    except Exception:
+        pass
 
 
 def review(identity, note, actor):

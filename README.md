@@ -41,7 +41,7 @@ docker compose up -d --build --wait
 |---|---|
 | frontend | Nginx 与原生 HTML、CSS、JavaScript |
 | backend | Python 3.11、FastAPI、SQLAlchemy |
-| worker | Python 持久队列执行与 Redis 唤醒信号 |
+| worker | Python 持久队列执行与 Redis 唤醒信号，修订逐条落账，中断后从断点续跑 |
 | db | PostgreSQL 16，持久卷保存档案、执行、证据及审计 |
 | redis | Redis 7，追加日志卷保存队列唤醒信号 |
 

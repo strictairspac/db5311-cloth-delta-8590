@@ -2,8 +2,9 @@
 
 from collections import Counter
 
-from src.services import cloth_stock
+from src.services import cloth_stock, run_stock
 from src.services.cloth_quota import warehouse_plan
+from src.services.run_stock import audit_row as _audit_row
 
 
 BOOK = '记账'
@@ -109,16 +110,6 @@ def validate(payload):
         _integer(row, 'capacity_pieces', 0, location)
 
 
-def _audit_row(index, event, status, retracted, added):
-    row = {'流水行': index, '批次': event['batch_id'], '修订号': event['revision'],
-           '动作': event['action'], '判定': status}
-    for label, contribution in [('撤回', retracted), ('累加', added)]:
-        row[f'{label}等级'] = contribution['grade'] if contribution else ''
-        row[f'{label}重量（克）'] = contribution['weight_g'] if contribution else 0
-        row[f'{label}件数'] = contribution['pieces'] if contribution else 0
-    return row
-
-
 def _conflict_report(index, event, stored, audit):
     identity = f"{event['batch_id']} 第 {event['revision']} 版"
     return {
@@ -135,41 +126,26 @@ def _conflict_report(index, event, stored, audit):
     }
 
 
-def solve(payload, engine):
-    validate(payload)
-    audit = []
-    counts = Counter()
-    with engine.begin() as conn:
-        cloth_stock.initialize(conn)
-        for row in payload['opening_batches']:
-            cloth_stock.apply_revision(conn, {**row, 'action': BOOK})
-        for index, event in enumerate(payload['revisions'], 1):
-            status, retracted, added = cloth_stock.apply_revision(conn, event)
-            if status == '版本冲突':
-                return _conflict_report(index, event, retracted, audit)
-            counts[status] += 1
-            audit.append(_audit_row(index, event, status, retracted, added))
-
-        reconciled = conn.execute(cloth_stock.RECONCILE).mappings().all()
-        differences = sum(row['differs'] for row in reconciled)
-        metrics = {
-            '生效修订数': counts['生效'], '重复修订数': counts['重复'], '过期修订数': counts['过期'],
-            '核对库存等级数': len(reconciled), '库存差异等级数': differences,
-        }
-        sections = [
-            {'title': 'PostgreSQL 全量对账', 'rows': [
-                {'等级': row['grade'], '增量重量（克）': row['incremental_weight'], '全量重量（克）': row['full_weight'],
-                 '增量件数': row['incremental_pieces'], '全量件数': row['full_pieces'],
-                 '判定': '有差异' if row['differs'] else '一致'}
-                for row in reconciled
-            ]},
-            {'title': '批次修订轨迹', 'rows': audit},
-        ]
-        if differences:
-            return {'summary': f'{differences} 个等级库存存在差异，暂停本次仓位与转裁发单。',
-                    'metrics': metrics, 'sections': sections}
-        active_batches = conn.execute(cloth_stock.ACTIVE_BATCHES).mappings().all()
-
+def _stock_report(payload, reconciled, audit, active_batches):
+    """Assemble the run report; the quota order is only issued when reconciled."""
+    differences = sum(row['differs'] for row in reconciled)
+    counts = Counter(row['判定'] for row in audit)
+    metrics = {
+        '生效修订数': counts['生效'], '重复修订数': counts['重复'], '过期修订数': counts['过期'],
+        '核对库存等级数': len(reconciled), '库存差异等级数': differences,
+    }
+    sections = [
+        {'title': 'PostgreSQL 全量对账', 'rows': [
+            {'等级': row['grade'], '增量重量（克）': row['incremental_weight'], '全量重量（克）': row['full_weight'],
+             '增量件数': row['incremental_pieces'], '全量件数': row['full_pieces'],
+             '判定': '有差异' if row['differs'] else '一致'}
+            for row in reconciled
+        ]},
+        {'title': '批次修订轨迹', 'rows': audit},
+    ]
+    if differences:
+        return {'summary': f'{differences} 个等级库存存在差异，暂停本次仓位与转裁发单。',
+                'metrics': metrics, 'sections': sections}
     decisions, cuts, missing_quotas = warehouse_plan(reconciled, active_batches, payload['quotas'])
     metrics.update({'建议转裁批次数': len(cuts), '缺少配额等级数': missing_quotas})
     sections[1:1] = [
@@ -180,3 +156,48 @@ def solve(payload, engine):
     if missing_quotas:
         summary += f'{missing_quotas} 个等级缺少配额，暂停这些等级发单。'
     return {'summary': summary, 'metrics': metrics, 'sections': sections}
+
+
+def _solve_once(payload, engine):
+    """Single-transaction run on temporary tables (no checkpoint state)."""
+    with engine.begin() as conn:
+        cloth_stock.initialize(conn)
+        for row in payload['opening_batches']:
+            cloth_stock.apply_revision(conn, {**row, 'action': BOOK})
+        audit = []
+        for index, event in enumerate(payload['revisions'], 1):
+            status, retracted, added = cloth_stock.apply_revision(conn, event)
+            if status == '版本冲突':
+                return _conflict_report(index, event, retracted, audit)
+            audit.append(_audit_row(index, event, status, retracted, added))
+        reconciled = conn.execute(cloth_stock.RECONCILE).mappings().all()
+        active = None if sum(row['differs'] for row in reconciled) else \
+            conn.execute(cloth_stock.ACTIVE_BATCHES).mappings().all()
+    return _stock_report(payload, reconciled, audit, active)
+
+
+def _solve_run(payload, engine, run_id, token):
+    """Checkpointed run: resumes from the last posted revision of the same run."""
+    store = run_stock.Store(engine, run_id, token)
+    processed = store.initialize(payload['opening_batches'])
+    for index, event in enumerate(payload['revisions'], 1):
+        if index <= processed:
+            continue
+        outcome = store.apply(index, event)
+        if outcome is None:
+            continue
+        if outcome['status'] == '版本冲突':
+            return _conflict_report(index, event, outcome['stored'], store.trail())
+    with engine.connect() as conn:
+        reconciled = conn.execute(run_stock.RECONCILE, {'run_id': run_id}).mappings().all()
+        active = None if sum(row['differs'] for row in reconciled) else \
+            conn.execute(run_stock.ACTIVE_BATCHES, {'run_id': run_id}).mappings().all()
+        audit = store.trail(conn)
+    return _stock_report(payload, reconciled, audit, active)
+
+
+def solve(payload, engine, run_id=None, token=None):
+    validate(payload)
+    if run_id is None:
+        return _solve_once(payload, engine)
+    return _solve_run(payload, engine, run_id, token)
